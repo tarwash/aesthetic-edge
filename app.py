@@ -389,8 +389,27 @@ def http_session() -> requests.Session:
     return sess
 
 
+REQUESTS_PER_SECOND = 15   # stay under Kalshi's public limit so we never get throttled
+
+
+@st.cache_resource
+def rate_limiter() -> dict:
+    return {"lock": threading.Lock(), "next": 0.0}
+
+
+def _wait_turn() -> None:
+    rl = rate_limiter()
+    with rl["lock"]:
+        now = time.monotonic()
+        slot = max(now, rl["next"])
+        rl["next"] = slot + 1.0 / REQUESTS_PER_SECOND
+    if slot > now:
+        time.sleep(slot - now)
+
+
 def kalshi_get(path: str, params: dict | None = None) -> dict:
     for attempt in range(3):
+        _wait_turn()
         resp = http_session().get(f"{KALSHI_API}{path}", params=params or {}, timeout=10)
         if resp.status_code == 429 and attempt < 2:   # rate-limited: wait a beat, retry
             time.sleep(1.0 + attempt)
@@ -430,46 +449,93 @@ ERROR_RETRY_SECONDS = 60   # retry a failed list after a minute
 
 @st.cache_resource
 def market_store() -> dict:
-    return {"lock": threading.Lock(), "data": {}}   # ticker -> (fetched_at, rows, error)
+    return {
+        "lock": threading.Lock(),
+        "data": {},            # ticker -> (fetched_at, rows, error)
+        "inflight": set(),     # tickers being refreshed in the background
+        "pool": ThreadPoolExecutor(max_workers=6),
+    }
 
 
-def load_markets(series_meta: tuple) -> tuple[list[dict], list[str]]:
-    """series_meta = ((ticker, title, sport, bet_type), ...). Uses cache, fetches the rest in parallel."""
+def _fetch_one(meta):
+    ticker, title, sport, bet_type = meta
+    try:
+        return markets_to_rows(_open_events(ticker), sport, bet_type), None
+    except Exception as exc:
+        return [], f"{title}: {exc}"
+
+
+def _background_refresh(metas) -> None:
+    """Quietly (re)load series without making anyone wait."""
+    store = market_store()
+
+    def job(meta):
+        try:
+            got, err = _fetch_one(meta)
+            with store["lock"]:
+                store["data"][meta[0]] = (time.time(), got, err)
+        finally:
+            with store["lock"]:
+                store["inflight"].discard(meta[0])
+
+    for meta in metas:
+        with store["lock"]:
+            if meta[0] in store["inflight"]:
+                continue
+            store["inflight"].add(meta[0])
+        store["pool"].submit(job, meta)
+
+
+def _is_stale(hit, now) -> bool:
+    max_age = ERROR_RETRY_SECONDS if hit[2] else CACHE_SECONDS
+    return now - hit[0] > max_age
+
+
+def load_markets(must_have: tuple, nice_to_have: tuple = ()) -> tuple[list[dict], list[str], int]:
+    """
+    must_have: series the page waits for (only the ones never loaded before).
+    nice_to_have: shown if already loaded; otherwise fetched in the background.
+    Stale data is shown instantly and refreshed in the background.
+    Returns (rows, failures, how many are still loading in the background).
+    """
     store = market_store()
     now = time.time()
-    todo = []
-    for meta in series_meta:
+    missing, stale = [], []
+    for meta in must_have:
         hit = store["data"].get(meta[0])
-        max_age = ERROR_RETRY_SECONDS if (hit and hit[2]) else CACHE_SECONDS
-        if not hit or now - hit[0] > max_age:
-            todo.append(meta)
+        if hit is None:
+            missing.append(meta)
+        elif _is_stale(hit, now):
+            stale.append(meta)
+    for meta in nice_to_have:
+        hit = store["data"].get(meta[0])
+        if hit is None or _is_stale(hit, now):
+            stale.append(meta)
 
-    if todo:
-        def work(meta):
-            ticker, title, sport, bet_type = meta
-            try:
-                return meta, markets_to_rows(_open_events(ticker), sport, bet_type), None
-            except Exception as exc:
-                return meta, [], f"{title}: {exc}"
-
-        bar = st.progress(0.0, text=f"Loading Kalshi markets… 0 of {len(todo)}")
-        with ThreadPoolExecutor(max_workers=12) as pool:
-            futures = [pool.submit(work, m) for m in todo]
+    if missing:
+        bar = st.progress(0.0, text=f"Loading Kalshi markets… 0 of {len(missing)}")
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_fetch_one, m): m for m in missing}
             for i, fut in enumerate(as_completed(futures), start=1):
-                meta, got, err = fut.result()
+                got, err = fut.result()
                 with store["lock"]:
-                    store["data"][meta[0]] = (time.time(), got, err)
-                if i % 3 == 0 or i == len(todo):
-                    bar.progress(i / len(todo), text=f"Loading Kalshi markets… {i} of {len(todo)}")
+                    store["data"][futures[fut][0]] = (time.time(), got, err)
+                if i % 3 == 0 or i == len(missing):
+                    bar.progress(i / len(missing), text=f"Loading Kalshi markets… {i} of {len(missing)}")
         bar.empty()
 
-    rows, failures = [], []
-    for meta in series_meta:
-        _, got, err = store["data"].get(meta[0], (0, [], None))
-        rows.extend(got)
-        if err:
-            failures.append(err)
-    return rows, failures
+    _background_refresh(stale)
+
+    rows, failures, pending = [], [], 0
+    for meta in tuple(must_have) + tuple(nice_to_have):
+        hit = store["data"].get(meta[0])
+        if hit is None:
+            pending += 1
+            continue
+        rows.extend(hit[1])
+        if hit[2]:
+            failures.append(hit[2])
+    return rows, failures, pending
 
 
 def to_float(value) -> float:
@@ -684,7 +750,10 @@ with st.sidebar:
     max_picks = st.slider("Max picks on slip", 1, 30, 10)
     show_skips = st.toggle("Show NO (skip) rows on the board", value=True)
 
-    if st.button("🔄 Refresh from Kalshi"):
+    b1, b2 = st.columns(2)
+    if b1.button("✨ Refresh view"):
+        st.rerun()
+    if b2.button("🔄 New prices"):
         st.cache_data.clear()
         market_store()["data"].clear()
         st.rerun()
@@ -729,17 +798,32 @@ wanted = tuple(
     for s in series
     if s["sport"] in chosen_sports and s["bet_type"] in chosen_types
 )
+# Speed: with ALL sports + ALL bet types, wait only for game lines (few lists, loads fast);
+# props for every league fill in quietly in the background.
+if pick_sport == ALL_SPORTS and pick_type == ALL_TYPES:
+    must = tuple(w for w in wanted if w[3] == "Game lines")
+    nice = tuple(w for w in wanted if w[3] != "Game lines")
+else:
+    must, nice = wanted, ()
 
 # ---------------------------------------------------------------------------
 # LOAD MARKETS
 # ---------------------------------------------------------------------------
-rows, failures, using_demo = [], [], False
+rows, failures, using_demo, pending = [], [], False, 0
 if wanted:
-    rows, failures = load_markets(wanted)
+    rows, failures, pending = load_markets(must, nice)
+    # Pre-load everything else (all sports, all non-futures bet types) for instant filter changes
+    _background_refresh(tuple(
+        (s["ticker"], s["title"], s["sport"], s["bet_type"]) for s in series
+        if s["bet_type"] in DEFAULT_BET_TYPES and s["ticker"] not in market_store()["data"]
+    ))
+if pending:
+    st.caption(f"⏳ Still loading props for {pending} more market list(s) in the background — "
+               "they'll appear as you use the app, or tap **Refresh view** in the sidebar.")
 
-if not rows and (series_error is not None or (failures and len(failures) == len(wanted))):
+if not rows and (series_error is not None or (failures and len(failures) >= len(must))):
     st.warning("Couldn't reach Kalshi right now, so you're seeing **sample games**. "
-               "Check your internet connection and hit **Refresh from Kalshi**.")
+               "Check your internet connection and tap **🔄 New prices** in the sidebar.")
     rows = [r for r in demo_rows() if r["sport"] in chosen_sports and r["bet_type"] in chosen_types]
     using_demo = True
 elif failures:
